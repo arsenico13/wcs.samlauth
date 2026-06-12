@@ -5,6 +5,7 @@ from plone.protect.interfaces import IDisableCSRFProtection
 from Products.Five.browser import BrowserView
 from urllib.parse import quote
 from urllib.parse import urlparse
+from urllib.parse import urlunparse
 from zExceptions import BadRequest
 from zope.interface import alsoProvides
 import logging
@@ -12,6 +13,34 @@ import logging
 
 LOGGER = logging.getLogger(__name__)
 SAML_AUTHN_REQUEST_COOKIE_NAME = '__saml'
+LOGIN_PATH_SUFFIX = '/login'
+
+
+def normalize_return_url(url):
+    """Return the target URL a user should land on after login."""
+    if not url:
+        return None
+
+    parsed = urlparse(url)
+    path = parsed.path.rstrip('/')
+    if path.endswith(LOGIN_PATH_SUFFIX):
+        path = path[:-len(LOGIN_PATH_SUFFIX)] or '/'
+        url = urlunparse(parsed._replace(path=path))
+    return url
+
+
+def get_request_return_url(request):
+    return normalize_return_url(
+        request.get('came_from', None) or request.get('return_url', None)
+    )
+
+
+def is_allowed_redirect_url(url, allowed_hosts):
+    """Validate redirect targets without rejecting root-relative URLs."""
+    parsed = urlparse(url)
+    if not parsed.netloc:
+        return parsed.scheme == '' and url.startswith('/') and not url.startswith('//')
+    return parsed.scheme in ('http', 'https') and parsed.netloc in allowed_hosts
 
 
 class BaseSamlView(BrowserView):
@@ -59,7 +88,7 @@ class LoginView(BaseSamlView):
                 return f'SAML SP configuration error: {str(error)}'
             return 'SAML SP configuration not valid, please check logs'
 
-        return_url = self.request.get('came_from', None)
+        return_url = get_request_return_url(self.request)
         if not return_url:
             return_url = api.portal.get().absolute_url()
         login_url = auth.login(return_to=return_url)
@@ -98,12 +127,12 @@ class CallbackView(BaseSamlView):
     def get_redirect_url(self):
         url = api.portal.get().absolute_url()
         if 'RelayState' in self.request.form:
-            relay_state = self.request.form['RelayState']
+            relay_state = normalize_return_url(self.request.form['RelayState'])
             allowed_hosts = [self.saml_request['http_host']]
             allowed_hosts.extend(
                 list(self.context.getProperty('allowed_redirect_hosts', ()))
             )
-            if urlparse(relay_state).netloc in allowed_hosts:
+            if relay_state and is_allowed_redirect_url(relay_state, allowed_hosts):
                 url = relay_state
 
         create_api_session = self.context.getProperty("create_api_session")
@@ -163,9 +192,9 @@ class RequireLoginView(BrowserView):
         if api.user.is_anonymous():
             # context is our PAS plugin
             url = self.context.absolute_url() + '/sls'
-            came_from = self.request.get('came_from', None)
-            if came_from:
-                url += f'?came_from={quote(came_from)}'
+            return_url = get_request_return_url(self.request)
+            if return_url:
+                url += f'?came_from={quote(return_url)}'
         else:
             url = api.portal.get().absolute_url()
             url += '/insufficient-privileges'
